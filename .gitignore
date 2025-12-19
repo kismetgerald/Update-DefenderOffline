@@ -1,0 +1,41 @@
+# Claude Code documentation (project-specific)
+claude.md
+
+# Runtime directories
+Config/
+Logs/
+Reports/
+
+# IDE settings
+.vscode/
+
+# Windows thumbnail cache
+Thumbs.db
+ehthumbs.db
+
+# Folder config file
+Desktop.ini
+
+# Recycle Bin
+$RECYCLE.BIN/
+
+# PowerShell
+*.ps1xml
+
+# Credentials and secrets
+*.xml
+!Config/.gitkeep
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+~$*
+
+# Editor backups
+*~
+*.bak
+*.swp
+*.swo

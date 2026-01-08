@@ -446,14 +446,112 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
 
     try {
         $Results = $TargetComputers | ForEach-Object -Parallel {
-            $result = & $using:UpdateScriptBlock $_ $using:SourceFile $using:TempFolderOnTarget $using:MpamFileName $using:WhatIfMode $using:LogSharePath
-            # Increment progress counter (thread-safe)
-            [System.Threading.Interlocked]::Increment([ref]$using:progress.Completed) | Out-Null
-            $result
+            param($Computer)
+
+            # Inline update logic (formerly $UpdateScriptBlock)
+            $result = [pscustomobject]@{
+                ComputerName = $Computer
+                Status       = 'Unknown'
+                OldVersion   = ''
+                NewVersion   = ''
+                DurationSec  = 0
+                Details      = ''
+            }
+
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+            try {
+                if ($using:WhatIfMode) {
+                    $result.Status = 'WhatIf'
+                    $result.Details = 'Dry-run mode – no changes made'
+                    return $result
+                }
+
+                if (-not (Test-NetConnection -ComputerName $Computer -Port 5985 -InformationLevel Quiet -WarningAction SilentlyContinue)) {
+                    throw "WinRM (5985) not reachable"
+                }
+
+                $session = New-PSSession -ComputerName $Computer -ErrorAction Stop
+
+                $currentVer = Invoke-Command -Session $session -ScriptBlock {
+                    try { (Get-MpComputerStatus -ErrorAction Stop).AntivirusSignatureVersion } catch { $null }
+                }
+                $result.OldVersion = $currentVer
+
+                if ($using:MpamFileName -notmatch '(\d+\.\d+\.\d+\.\d+)') {
+                    throw "Cannot parse version from filename: $using:MpamFileName"
+                }
+                $newVer = [version]$Matches[1]
+
+                if ($currentVer -and $currentVer -ge $newVer) {
+                    $result.Status = 'No Update Needed'
+                    $result.NewVersion = $currentVer
+                    $result.Details = "Already at version $currentVer"
+                    Remove-PSSession $session -ErrorAction SilentlyContinue
+                    return $result
+                }
+
+                Invoke-Command -Session $session -ScriptBlock {
+                    New-Item -Path $using:TempFolderOnTarget -ItemType Directory -Force | Out-Null
+                }
+
+                $remoteFile = Invoke-Command -Session $session -ScriptBlock {
+                    Join-Path $using:TempFolderOnTarget $using:MpamFileName
+                }
+
+                Copy-Item -Path $using:SourceFile -Destination $remoteFile -ToSession $session -Force
+
+                $install = Invoke-Command -Session $session -ScriptBlock {
+                    $log = Join-Path $using:TempFolderOnTarget "install_$(Get-Date -f 'yyyyMMdd_HHmmss').log"
+                    $p = Start-Process -FilePath $using:remoteFile -ArgumentList '/q' -Wait -PassThru -NoNewWindow `
+                        -RedirectStandardOutput $log -RedirectStandardError ($log + '.err')
+                    [pscustomobject]@{ ExitCode = $p.ExitCode; Log = $log }
+                }
+
+                $finalVer = Invoke-Command -Session $session -ScriptBlock {
+                    try { (Get-MpComputerStatus).AntivirusSignatureVersion } catch { $null }
+                }
+                $result.NewVersion = $finalVer
+
+                # Optional log collection
+                if ($using:LogSharePath -and (Test-Path $using:LogSharePath -ErrorAction SilentlyContinue)) {
+                    try {
+                        $targetLogDir = Join-Path $using:LogSharePath $Computer
+                        if (-not (Test-Path $targetLogDir)) {
+                            New-Item -Path $targetLogDir -ItemType Directory -Force | Out-Null
+                        }
+                        Copy-Item -Path "$remoteFile.*" -Destination $targetLogDir -FromSession $session -Force -ErrorAction SilentlyContinue
+                    }
+                    catch {}
+                }
+
+                Invoke-Command -Session $session -ScriptBlock {
+                    Remove-Item (Split-Path $using:remoteFile -Parent) -Recurse -Force -ErrorAction SilentlyContinue
+                }
+                Remove-PSSession $session
+
+                if ($install.ExitCode -eq 0 -and $finalVer -ge $newVer) {
+                    $result.Status = 'Success'
+                    $result.Details = "$currentVer → $finalVer"
+                } else {
+                    $result.Status = 'Failed'
+                    $result.Details = "Installer exit code: $($install.ExitCode)"
+                }
+            }
+            catch {
+                $result.Status = 'Failed'
+                $result.Details = $_.Exception.Message -replace "`r`n", " "
+            }
+            finally {
+                $sw.Stop()
+                $result.DurationSec = [math]::Round($sw.Elapsed.TotalSeconds, 2)
+                [System.Threading.Interlocked]::Increment([ref]$using:progress.Completed) | Out-Null
+                $result
+            }
+
         } -ThrottleLimit $ParallelThreads
     }
     finally {
-        # Clean up progress timer
         $progressTimer.Stop()
         $progressTimer.Dispose()
         Unregister-Event -SourceIdentifier ProgressTimer -ErrorAction SilentlyContinue
@@ -463,6 +561,7 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
     Write-Log "Parallel execution completed: $($Results.Count) computers processed" 'SUCCESS'
 }
 else {
+    # SERIAL MODE (PowerShell 5.1)
     Write-Log "Executing in SERIAL mode (PowerShell 5.1)" 'WARN'
     $i = 0
     foreach ($comp in $TargetComputers) {

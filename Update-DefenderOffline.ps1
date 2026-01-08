@@ -78,9 +78,9 @@
                      • Network share containing the latest mpam-fe.exe (x64)
                      • (Optional) Domain-joined machine or RSAT:ActiveDirectory for auto hosts.conf generation
     
-    Version        : 0.0.1
+    Version        : 0.0.2
     Created        : 2025-11-27
-    Last Updated   : 2025-12-18
+    Last Updated   : 2026-01-08
 
 #>
 
@@ -280,9 +280,43 @@ if (-not $TargetComputers) { Write-Log "No target computers found!" 'ERROR'; ret
 Write-Log "Will process $($TargetComputers.Count) computers" 'HEADER'
 
 # ===================================================================
+# Detect Latest mpam-fe.exe File
+# ===================================================================
+function Get-LatestMpamFile {
+    param([string]$Root)
+
+    $files = Get-ChildItem -Path $Root -Recurse -Filter "mpam-fe*.exe" -ErrorAction SilentlyContinue
+
+    if (-not $files) {
+        throw "No mpam-fe*.exe files found under $Root"
+    }
+
+    # Extract version from filename (e.g. mpam-fe_4_1.443.512.0.exe)
+    $filesWithVersion = foreach ($f in $files) {
+        if ($f.Name -match '(\d+\.\d+\.\d+\.\d+)') {
+            [pscustomobject]@{
+                File    = $f.FullName
+                Version = [version]$Matches[1]
+            }
+        }
+    }
+
+    if (-not $filesWithVersion) {
+        throw "Found mpam-fe.exe files but none contained a version number."
+    }
+
+    return $filesWithVersion | Sort-Object Version -Descending | Select-Object -First 1
+}
+
+# ===================================================================
 # Core Update Logic (used in both serial and parallel)
 # ===================================================================
-$SourceFile = Join-Path $SourceSharePath $MpamFileName
+$latest = Get-LatestMpamFile -Root $SourceSharePath
+$SourceFile = $latest.File
+$MpamFileName = Split-Path $SourceFile -Leaf
+
+Write-Log "Latest mpam-fe package detected: $MpamFileName (version $($latest.Version))" "INFO"
+
 if (-not (Test-Path $SourceFile)) {
     Write-Log "CRITICAL: Source file not found: $SourceFile" 'ERROR'
     throw "mpam-fe.exe file missing!"

@@ -309,6 +309,120 @@ function Get-LatestMpamFile {
 }
 
 # ===================================================================
+# Defender Update Function
+# ===================================================================
+function Invoke-DefenderUpdate {
+    param(
+        [string]$Computer,
+        [string]$SourceFile,
+        [string]$TempFolderOnTarget,
+        [string]$MpamFileName,
+        [switch]$WhatIfMode,
+        [string]$LogSharePath
+    )
+
+    $result = [pscustomobject]@{
+        ComputerName = $Computer
+        Status       = 'Unknown'
+        OldVersion   = ''
+        NewVersion   = ''
+        DurationSec  = 0
+        Details      = ''
+        Attempt      = 1
+        Timeout      = $false
+    }
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+    try {
+        if ($WhatIfMode) {
+            $result.Status = 'WhatIf'
+            $result.Details = 'Dry-run mode – no changes made'
+            return $result
+        }
+
+        if (-not (Test-NetConnection -ComputerName $Computer -Port 5985 -InformationLevel Quiet -WarningAction SilentlyContinue)) {
+            throw "WinRM (5985) not reachable"
+        }
+
+        $session = New-PSSession -ComputerName $Computer -ErrorAction Stop
+
+        $currentVer = Invoke-Command -Session $session -ScriptBlock {
+            try { (Get-MpComputerStatus -ErrorAction Stop).AntivirusSignatureVersion } catch { $null }
+        }
+        $result.OldVersion = $currentVer
+
+        if ($MpamFileName -notmatch '(\d+\.\d+\.\d+\.\d+)') {
+            throw "Cannot parse version from filename: $MpamFileName"
+        }
+        $newVer = [version]$Matches[1]
+
+        if ($currentVer -and $currentVer -ge $newVer) {
+            $result.Status = 'No Update Needed'
+            $result.NewVersion = $currentVer
+            $result.Details = "Already at version $currentVer"
+            Remove-PSSession $session -ErrorAction SilentlyContinue
+            return $result
+        }
+
+        Invoke-Command -Session $session -ScriptBlock {
+            New-Item -Path $using:TempFolderOnTarget -ItemType Directory -Force | Out-Null
+        }
+
+        $remoteFile = Invoke-Command -Session $session -ScriptBlock {
+            Join-Path $using:TempFolderOnTarget $using:MpamFileName
+        }
+
+        Copy-Item -Path $SourceFile -Destination $remoteFile -ToSession $session -Force
+
+        $install = Invoke-Command -Session $session -ScriptBlock {
+            $log = Join-Path $using:TempFolderOnTarget "install_$(Get-Date -f 'yyyyMMdd_HHmmss').log"
+            $p = Start-Process -FilePath $using:remoteFile -ArgumentList '/q' -Wait -PassThru -NoNewWindow `
+                -RedirectStandardOutput $log -RedirectStandardError ($log + '.err')
+            [pscustomobject]@{ ExitCode = $p.ExitCode; Log = $log }
+        }
+
+        $finalVer = Invoke-Command -Session $session -ScriptBlock {
+            try { (Get-MpComputerStatus).AntivirusSignatureVersion } catch { $null }
+        }
+        $result.NewVersion = $finalVer
+
+        if ($LogSharePath -and (Test-Path $LogSharePath -ErrorAction SilentlyContinue)) {
+            try {
+                $targetLogDir = Join-Path $LogSharePath $Computer
+                if (-not (Test-Path $targetLogDir)) {
+                    New-Item -Path $targetLogDir -ItemType Directory -Force | Out-Null
+                }
+                Copy-Item -Path "$remoteFile.*" -Destination $targetLogDir -FromSession $session -Force -ErrorAction SilentlyContinue
+            }
+            catch {}
+        }
+
+        Invoke-Command -Session $session -ScriptBlock {
+            Remove-Item (Split-Path $using:remoteFile -Parent) -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Remove-PSSession $session
+
+        if ($install.ExitCode -eq 0 -and $finalVer -ge $newVer) {
+            $result.Status = 'Success'
+            $result.Details = "$currentVer → $finalVer"
+        } else {
+            $result.Status = 'Failed'
+            $result.Details = "Installer exit code: $($install.ExitCode)"
+        }
+    }
+    catch {
+        $result.Status = 'Failed'
+        $result.Details = $_.Exception.Message -replace "`r`n", " "
+    }
+    finally {
+        $sw.Stop()
+        $result.DurationSec = [math]::Round($sw.Elapsed.TotalSeconds, 2)
+    }
+    return $result
+}
+
+# ===================================================================
 # Core Update Logic (used in both serial and parallel)
 # ===================================================================
 $latest = Get-LatestMpamFile -Root $SourceSharePath
@@ -417,149 +531,133 @@ $UpdateScriptBlock = {
 }
 
 # ===================================================================
-# Execution: Parallel (PS7+) or Serial (PS5.1)
+# Execution: Start-ThreadJob Parallel Engine (PS7+) or Serial (PS5.1)
 # ===================================================================
+
 $Results = @()
+$MaxConcurrent = $ParallelThreads
+$TimeoutSeconds = 300  # 5 minutes
+$RetryLimit = 2
 
-if ($PSVersionTable.PSVersion.Major -ge 7) {
-    Write-Log "Executing in PARALLEL mode ($ParallelThreads threads)" 'HEADER'
+# Prepare per-host log directory
+$PerHostLogDir = Join-Path $LogPath "PerHost"
+if (-not (Test-Path $PerHostLogDir)) {
+    New-Item -Path $PerHostLogDir -ItemType Directory -Force | Out-Null
+}
 
-    # Create a synchronized hashtable for progress tracking
-    $progress = [hashtable]::Synchronized(@{
-        Completed = 0
-        Total = $TargetComputers.Count
-    })
+# Build job queue
+$Queue = foreach ($comp in $TargetComputers) {
+    [pscustomobject]@{
+        Computer = $comp
+        Attempt  = 1
+        Status   = 'Pending'
+    }
+}
 
-    # Start a background timer for progress updates
-    $progressTimer = [System.Timers.Timer]::new(10000)  # Update every 10 seconds
-    $progressTimer.AutoReset = $true
-    $progressAction = {
-        $completed = $progress.Completed
-        $total = $progress.Total
-        if ($completed -gt 0) {
-            $pct = [math]::Round(($completed / $total) * 100, 1)
-            Write-Log "Progress: $completed of $total computers completed ($pct%)" 'INFO'
+$ActiveJobs = @()
+$Completed = @()
+$StartTimes = @{}
+
+Write-Log "Executing in THREADJOB mode ($MaxConcurrent concurrent jobs)" 'HEADER'
+
+$DashboardTimer = [System.Diagnostics.Stopwatch]::StartNew()
+
+while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
+
+    # Launch new jobs if capacity available
+    while ($ActiveJobs.Count -lt $MaxConcurrent -and $Queue.Count -gt 0) {
+        $item = $Queue[0]
+        $Queue = $Queue[1..($Queue.Count - 1)] 2>$null
+
+        $job = Start-ThreadJob -ScriptBlock {
+            Invoke-DefenderUpdate `
+                -Computer $using:item.Computer `
+                -SourceFile $using:SourceFile `
+                -TempFolderOnTarget $using:TempFolderOnTarget `
+                -MpamFileName $using:MpamFileName `
+                -WhatIfMode:$using:WhatIfMode `
+                -LogSharePath $using:LogSharePath
+        }
+
+        $StartTimes[$job.Id] = Get-Date
+        $job | Add-Member -NotePropertyName Computer -NotePropertyValue $item.Computer
+        $job | Add-Member -NotePropertyName Attempt  -NotePropertyValue $item.Attempt
+
+        $ActiveJobs += $job
+    }
+
+    # Check for completed jobs
+    foreach ($job in $ActiveJobs.ToArray()) {
+        if ($job.State -in 'Completed','Failed','Stopped') {
+            $result = Receive-Job $job -ErrorAction SilentlyContinue
+            $result.Attempt = $job.Attempt
+
+            # Write per-host log
+            $hostLog = Join-Path $PerHostLogDir "$($job.Computer).log"
+            Add-Content -Path $hostLog -Value "$(Get-Date) Attempt $($job.Attempt): $($result.Status) - $($result.Details)"
+
+            # Retry logic
+            if ($result.Status -eq 'Failed' -and $job.Attempt -lt $RetryLimit) {
+                Write-Log "Retry scheduled for $($job.Computer)" 'WARN'
+                $Queue += [pscustomobject]@{
+                    Computer = $job.Computer
+                    Attempt  = $job.Attempt + 1
+                    Status   = 'Pending'
+                }
+            } else {
+                $Completed += $result
+            }
+
+            Remove-Job $job -Force
+            $ActiveJobs = $ActiveJobs | Where-Object Id -ne $job.Id
         }
     }
-    Register-ObjectEvent -InputObject $progressTimer -EventName Elapsed -Action $progressAction -SourceIdentifier ProgressTimer | Out-Null
-    $progressTimer.Start()
 
-    try {
-        $Results = $TargetComputers | ForEach-Object -Parallel {
-            param($Computer)
+    # Timeout handling
+    foreach ($job in $ActiveJobs.ToArray()) {
+        $elapsed = (Get-Date) - $StartTimes[$job.Id]
+        if ($elapsed.TotalSeconds -gt $TimeoutSeconds) {
+            Write-Log "TIMEOUT: $($job.Computer) exceeded $TimeoutSeconds seconds" 'ERROR'
+            Stop-Job $job -Force
 
-            # Inline update logic (formerly $UpdateScriptBlock)
-            $result = [pscustomobject]@{
-                ComputerName = $Computer
-                Status       = 'Unknown'
+            $Completed += [pscustomobject]@{
+                ComputerName = $job.Computer
+                Status       = 'Failed'
                 OldVersion   = ''
                 NewVersion   = ''
-                DurationSec  = 0
-                Details      = ''
+                DurationSec  = $elapsed.TotalSeconds
+                Details      = 'Timeout'
+                Attempt      = $job.Attempt
+                Timeout      = $true
             }
 
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-
-            try {
-                if ($using:WhatIfMode) {
-                    $result.Status = 'WhatIf'
-                    $result.Details = 'Dry-run mode – no changes made'
-                    return $result
-                }
-
-                if (-not (Test-NetConnection -ComputerName $Computer -Port 5985 -InformationLevel Quiet -WarningAction SilentlyContinue)) {
-                    throw "WinRM (5985) not reachable"
-                }
-
-                $session = New-PSSession -ComputerName $Computer -ErrorAction Stop
-
-                $currentVer = Invoke-Command -Session $session -ScriptBlock {
-                    try { (Get-MpComputerStatus -ErrorAction Stop).AntivirusSignatureVersion } catch { $null }
-                }
-                $result.OldVersion = $currentVer
-
-                if ($using:MpamFileName -notmatch '(\d+\.\d+\.\d+\.\d+)') {
-                    throw "Cannot parse version from filename: $using:MpamFileName"
-                }
-                $newVer = [version]$Matches[1]
-
-                if ($currentVer -and $currentVer -ge $newVer) {
-                    $result.Status = 'No Update Needed'
-                    $result.NewVersion = $currentVer
-                    $result.Details = "Already at version $currentVer"
-                    Remove-PSSession $session -ErrorAction SilentlyContinue
-                    return $result
-                }
-
-                Invoke-Command -Session $session -ScriptBlock {
-                    New-Item -Path $using:TempFolderOnTarget -ItemType Directory -Force | Out-Null
-                }
-
-                $remoteFile = Invoke-Command -Session $session -ScriptBlock {
-                    Join-Path $using:TempFolderOnTarget $using:MpamFileName
-                }
-
-                Copy-Item -Path $using:SourceFile -Destination $remoteFile -ToSession $session -Force
-
-                $install = Invoke-Command -Session $session -ScriptBlock {
-                    $log = Join-Path $using:TempFolderOnTarget "install_$(Get-Date -f 'yyyyMMdd_HHmmss').log"
-                    $p = Start-Process -FilePath $using:remoteFile -ArgumentList '/q' -Wait -PassThru -NoNewWindow `
-                        -RedirectStandardOutput $log -RedirectStandardError ($log + '.err')
-                    [pscustomobject]@{ ExitCode = $p.ExitCode; Log = $log }
-                }
-
-                $finalVer = Invoke-Command -Session $session -ScriptBlock {
-                    try { (Get-MpComputerStatus).AntivirusSignatureVersion } catch { $null }
-                }
-                $result.NewVersion = $finalVer
-
-                # Optional log collection
-                if ($using:LogSharePath -and (Test-Path $using:LogSharePath -ErrorAction SilentlyContinue)) {
-                    try {
-                        $targetLogDir = Join-Path $using:LogSharePath $Computer
-                        if (-not (Test-Path $targetLogDir)) {
-                            New-Item -Path $targetLogDir -ItemType Directory -Force | Out-Null
-                        }
-                        Copy-Item -Path "$remoteFile.*" -Destination $targetLogDir -FromSession $session -Force -ErrorAction SilentlyContinue
-                    }
-                    catch {}
-                }
-
-                Invoke-Command -Session $session -ScriptBlock {
-                    Remove-Item (Split-Path $using:remoteFile -Parent) -Recurse -Force -ErrorAction SilentlyContinue
-                }
-                Remove-PSSession $session
-
-                if ($install.ExitCode -eq 0 -and $finalVer -ge $newVer) {
-                    $result.Status = 'Success'
-                    $result.Details = "$currentVer → $finalVer"
-                } else {
-                    $result.Status = 'Failed'
-                    $result.Details = "Installer exit code: $($install.ExitCode)"
-                }
-            }
-            catch {
-                $result.Status = 'Failed'
-                $result.Details = $_.Exception.Message -replace "`r`n", " "
-            }
-            finally {
-                $sw.Stop()
-                $result.DurationSec = [math]::Round($sw.Elapsed.TotalSeconds, 2)
-                [System.Threading.Interlocked]::Increment([ref]$using:progress.Completed) | Out-Null
-                $result
-            }
-
-        } -ThrottleLimit $ParallelThreads
-    }
-    finally {
-        $progressTimer.Stop()
-        $progressTimer.Dispose()
-        Unregister-Event -SourceIdentifier ProgressTimer -ErrorAction SilentlyContinue
-        Get-Job -Name ProgressTimer -ErrorAction SilentlyContinue | Remove-Job -Force
+            Remove-Job $job -Force
+            $ActiveJobs = $ActiveJobs | Where-Object Id -ne $job.Id
+        }
     }
 
-    Write-Log "Parallel execution completed: $($Results.Count) computers processed" 'SUCCESS'
+    # Dashboard
+    if ($DashboardTimer.Elapsed.TotalSeconds -ge 5) {
+        $DashboardTimer.Restart()
+        $running = $ActiveJobs.Count
+        $pending = $Queue.Count
+        $done    = $Completed.Count
+
+        Write-Host ""
+        Write-Host "=== Defender Update Dashboard ===" -ForegroundColor Cyan
+        Write-Host "Running:     $running"
+        Write-Host "Pending:     $pending"
+        Write-Host "Completed:   $done"
+        Write-Host "Elapsed:     $([string]::Format('{0:hh\:mm\:ss}', (Get-Date) - $ScriptStartTime))"
+        Write-Host ""
+    }
+
+    Start-Sleep -Milliseconds 500
 }
+
+$Results = $Completed
+Write-Log "ThreadJob execution completed: $($Results.Count) computers processed" 'SUCCESS'
+
 else {
     # SERIAL MODE (PowerShell 5.1)
     Write-Log "Executing in SERIAL mode (PowerShell 5.1)" 'WARN'

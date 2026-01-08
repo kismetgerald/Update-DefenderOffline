@@ -418,8 +418,8 @@ function Invoke-DefenderUpdate {
     finally {
         $sw.Stop()
         $result.DurationSec = [math]::Round($sw.Elapsed.TotalSeconds, 2)
-        return $result
     }
+    return $result
 }
 
 # ===================================================================

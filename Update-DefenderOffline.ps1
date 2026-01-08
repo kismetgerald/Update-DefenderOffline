@@ -656,6 +656,35 @@ function New-HtmlReport {
     <p><strong>Run Date:</strong> $ScriptStartTime<br>
        <strong>Source File:</strong> $MpamFileName<br>
        <strong>Total Duration:</strong> $($RunTime.TotalMinutes.ToString('N2')) minutes</p>
+       <h2>Version History Summary</h2>
+    <p>
+    <strong>Oldest Version Found:</strong> $OldestVersion<br>
+    <strong>Newest Version Applied:</strong> $NewestVersion<br>
+    <strong>Average Delta:</strong> $AverageDelta versions<br>
+    <strong>Hosts Already Current:</strong> $($Data.Where{$_.Status -eq 'No Update Needed'}.Count)<br>
+    <strong>Hosts Updated:</strong> $($Data.Where{$_.Status -eq 'Success'}.Count)<br>
+    <strong>Hosts Failed:</strong> $($Data.Where{$_.Status -eq 'Failed'}.Count)
+    </p>
+
+    <h2>Version History Details</h2>
+    <table>
+        <tr>
+            <th>Computer</th>
+            <th>Old Version</th>
+            <th>New Version</th>
+            <th>Delta</th>
+        </tr>
+        $(
+            $Data | ForEach-Object {
+                "<tr>
+                    <td>$($_.ComputerName)</td>
+                    <td>$($_.OldVersion)</td>
+                    <td>$($_.NewVersion)</td>
+                    <td>$($_.Delta)</td>
+                </tr>"
+            } -join "`n"
+        )
+    </table>
 
     <h2>Summary: $summary</h2>
 
@@ -673,6 +702,30 @@ function New-HtmlReport {
 }
 
 $TotalDuration = (Get-Date) - $ScriptStartTime
+# ===================================================================
+# Version History Calculations
+# ===================================================================
+foreach ($r in $Results) {
+    if ($r.OldVersion -and $r.NewVersion) {
+        try {
+            $r | Add-Member -NotePropertyName Delta -NotePropertyValue ([version]$r.NewVersion - [version]$r.OldVersion).Build -Force
+        } catch {
+            $r | Add-Member -NotePropertyName Delta -NotePropertyValue 'Unknown' -Force
+        }
+    } else {
+        $r | Add-Member -NotePropertyName Delta -NotePropertyValue 'Unknown' -Force
+    }
+
+    # Log raw version history
+    Write-Log "VersionHistory: $($r.ComputerName) Old=$($r.OldVersion) New=$($r.NewVersion) Delta=$($r.Delta)" 'INFO'
+}
+
+# Fleet-wide analytics
+$validDeltas = $Results | Where-Object { $_.Delta -is [int] }
+$OldestVersion = ($Results | Where-Object OldVersion | Sort-Object OldVersion | Select-Object -First 1).OldVersion
+$NewestVersion = ($Results | Where-Object NewVersion | Sort-Object NewVersion -Descending | Select-Object -First 1).NewVersion
+$AverageDelta  = if ($validDeltas) { [math]::Round(($validDeltas.Delta | Measure-Object -Average).Average, 1) } else { 'Unknown' }
+
 $HtmlReport = New-HtmlReport -Data $Results -RunTime $TotalDuration
 $ReportFile = Join-Path $ReportPath "DefenderUpdateReport_$(Get-Date -f 'yyyyMMdd_HHmmss').html"
 $HtmlReport | Out-File -FilePath $ReportFile -Encoding utf8
@@ -680,6 +733,12 @@ $HtmlReport | Out-File -FilePath $ReportFile -Encoding utf8
 Write-Log "UPDATE COMPLETE in $($TotalDuration.ToString('hh\:mm\:ss'))" 'HEADER'
 Write-Log "Success: $($Results.Where{$_.Status -eq 'Success'}.Count) | Failed: $($Results.Where{$_.Status -eq 'Failed'}.Count) | Skipped: $($Results.Where{$_.Status -eq 'No Update Needed'}.Count)" 'HEADER'
 Write-Log "Report saved: $ReportFile" 'SUCCESS'
+Write-Host ""
+Write-Host "=== Version Summary ===" -ForegroundColor Cyan
+Write-Host "Oldest version found : $OldestVersion"
+Write-Host "Newest version applied: $NewestVersion"
+Write-Host "Average delta        : $AverageDelta versions"
+Write-Host ""
 
 # ===================================================================
 # Optional Email Notification

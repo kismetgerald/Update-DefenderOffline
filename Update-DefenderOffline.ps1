@@ -606,15 +606,34 @@ while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
         $hostLog = Join-Path $PerHostLogDir "$computer.log"
         Add-Content -Path $hostLog -Value "$(Get-Date) Attempt $attempt: $($result.Status) - $($result.Details)"
 
-        # Retry logic (now using metadata Attempt)
-        if ($result.Status -eq 'Failed' -and $attempt -lt $RetryLimit) {
+        # -------------------------------
+        # FAILURE CLASSIFICATION LOGIC
+        # -------------------------------
+
+        $details = $result.Details.ToLower()
+
+        $isHardFail =
+            $details -match 'winrm' -or
+            $details -match 'not reachable' -or
+            $details -match 'offline' -or
+            $details -match 'unreachable' -or
+            $details -match 'access denied' -or
+            $details -match 'authentication' -or
+            $details -match 'cannot find' -or
+            $details -match 'dns' -or
+            $result.Timeout
+
+        if ($result.Status -eq 'Failed' -and -not $isHardFail -and $attempt -lt 3) {
+            # Retryable failure
             Write-Log "Retry scheduled for $computer (attempt $attempt → $($attempt + 1))" 'WARN'
             $Queue += [pscustomobject]@{
                 Computer = $computer
                 Attempt  = $attempt + 1
                 Status   = 'Pending'
             }
-        } else {
+        }
+        else {
+            # Hard fail OR retry limit reached OR success
             $Completed += $result
         }
 
@@ -623,8 +642,9 @@ while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
         $ActiveJobs = @($ActiveJobs | Where-Object Id -ne $job.Id)
         $JobMeta.Remove($job.Id) | Out-Null
         $StartTimes.Remove($job.Id) | Out-Null
+        
+        }
     }
-}
 
     # Timeout handling
     foreach ($job in @($ActiveJobs)) {
@@ -653,7 +673,7 @@ while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
         $ActiveJobs = @($ActiveJobs | Where-Object Id -ne $job.Id)
         $JobMeta.Remove($job.Id) | Out-Null
         $StartTimes.Remove($job.Id) | Out-Null
-        
+
         }
     }
 

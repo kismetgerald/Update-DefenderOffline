@@ -530,6 +530,7 @@ $Queue = foreach ($comp in $TargetComputers) {
 $ActiveJobs = @()
 $Completed = @()
 $StartTimes = @{}
+$JobMeta = @{}  # Key: Job.Id, Value: @{ Computer = <string>; Attempt = <int> }
 
 Write-Log "Executing in THREADJOB mode ($MaxConcurrent concurrent jobs)" 'HEADER'
 
@@ -540,7 +541,7 @@ while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
     # Launch new jobs if capacity available
     while ($ActiveJobs.Count -lt $MaxConcurrent -and $Queue.Count -gt 0) {
     $item = $Queue[0]
-    $Queue = $Queue[1..($Queue.Count - 1)] 2>$null
+    $Queue = if ($Queue.Count -gt 1) { $Queue[1..($Queue.Count - 1)] } else { @() }
 
     # Extract values into simple variables for Start-ThreadJob
     $comp    = $item.Computer
@@ -556,89 +557,106 @@ while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
             -LogSharePath $using:LogSharePath
     }
 
-    # Track metadata
+    # Track start time and metadata (do NOT use Add-Member on the job)
     $StartTimes[$job.Id] = Get-Date
-    $job | Add-Member -NotePropertyName Computer -NotePropertyValue $comp
-    $job | Add-Member -NotePropertyName Attempt  -NotePropertyValue $attempt
+    $JobMeta[$job.Id] = @{
+        Computer = $comp
+        Attempt  = $attempt
+    }
 
     $ActiveJobs = @($ActiveJobs) + $job
 }
 
-
     # Check for completed jobs
     foreach ($job in @($ActiveJobs)) {
-        if ($job.State -in 'Completed','Failed','Stopped') {
-            $result = Receive-Job $job -ErrorAction SilentlyContinue
+    if ($job.State -in 'Completed','Failed','Stopped') {
 
-            # Normalize result: handle null, arrays, or missing properties
-            if (-not $result) {
-                # Job produced no output – synthesize a failure result
-                $result = [pscustomobject]@{
-                    ComputerName = $job.Computer
-                    Status       = 'Failed'
-                    OldVersion   = ''
-                    NewVersion   = ''
-                    DurationSec  = 0
-                    Details      = 'Job produced no output'
-                    Attempt      = $job.Attempt
-                    Timeout      = $false
-                }
-            }
-            elseif ($result -is [array]) {
-                # If multiple objects, take the last one (most likely the main result)
-                $result = $result[-1]
-            }
+        # Look up metadata for this job
+        $meta = $JobMeta[$job.Id]
+        $computer = $meta.Computer
+        $attempt  = $meta.Attempt
 
-            # Ensure Attempt property exists
-            if ($result.PSObject.Properties.Name -contains 'Attempt') {
-                $result.Attempt = $job.Attempt
-            } else {
-                $result | Add-Member -NotePropertyName Attempt -NotePropertyValue $job.Attempt -Force
-            }
+        $result = Receive-Job $job -ErrorAction SilentlyContinue
 
-            # Write per-host log
-            $hostLog = Join-Path $PerHostLogDir "$($job.Computer).log"
-            Add-Content -Path $hostLog -Value "$(Get-Date) Attempt $($job.Attempt): $($result.Status) - $($result.Details)"
-
-            # Retry logic
-            if ($result.Status -eq 'Failed' -and $job.Attempt -lt $RetryLimit) {
-                Write-Log "Retry scheduled for $($job.Computer)" 'WARN'
-                $Queue += [pscustomobject]@{
-                    Computer = $job.Computer
-                    Attempt  = $job.Attempt + 1
-                    Status   = 'Pending'
-                }
-            } else {
-                $Completed += $result
-            }
-
-            Remove-Job $job -Force
-            $ActiveJobs = @($ActiveJobs | Where-Object Id -ne $job.Id)
-        }
-    }
-
-    # Timeout handling
-    foreach ($job in @($ActiveJobs)) {
-        $elapsed = (Get-Date) - $StartTimes[$job.Id]
-        if ($elapsed.TotalSeconds -gt $TimeoutSeconds) {
-            Write-Log "TIMEOUT: $($job.Computer) exceeded $TimeoutSeconds seconds" 'ERROR'
-            Stop-Job $job -Force
-
-            $Completed += [pscustomobject]@{
-                ComputerName = $job.Computer
+        # Normalize result: handle null or arrays
+        if (-not $result) {
+            $result = [pscustomobject]@{
+                ComputerName = $computer
                 Status       = 'Failed'
                 OldVersion   = ''
                 NewVersion   = ''
-                DurationSec  = $elapsed.TotalSeconds
-                Details      = 'Timeout'
-                Attempt      = $job.Attempt
-                Timeout      = $true
+                DurationSec  = 0
+                Details      = 'Job produced no output'
+                Attempt      = $attempt
+                Timeout      = $false
             }
+        }
+        elseif ($result -is [array]) {
+            $result = $result[-1]
+        }
 
-            Remove-Job $job -Force
-            $ActiveJobs = @($ActiveJobs | Where-Object Id -ne $job.Id)
+        # Ensure Attempt is present and aligned with metadata
+        if ($result.PSObject.Properties.Name -contains 'Attempt') {
+            $result.Attempt = $attempt
+        } else {
+            $result | Add-Member -NotePropertyName Attempt -NotePropertyValue $attempt -Force
+        }
+
+        # Write per-host log
+        $hostLog = Join-Path $PerHostLogDir "$computer.log"
+        Add-Content -Path $hostLog -Value "$(Get-Date) Attempt $attempt: $($result.Status) - $($result.Details)"
+
+        # Retry logic (now using metadata Attempt)
+        if ($result.Status -eq 'Failed' -and $attempt -lt $RetryLimit) {
+            Write-Log "Retry scheduled for $computer (attempt $attempt → $($attempt + 1))" 'WARN'
+            $Queue += [pscustomobject]@{
+                Computer = $computer
+                Attempt  = $attempt + 1
+                Status   = 'Pending'
+            }
+        } else {
+            $Completed += $result
+        }
+
+        # Cleanup
+        Remove-Job $job -Force
+        $ActiveJobs = @($ActiveJobs | Where-Object Id -ne $job.Id)
+        $JobMeta.Remove($job.Id) | Out-Null
+        $StartTimes.Remove($job.Id) | Out-Null
+    }
+}
+
+    # Timeout handling
+    foreach ($job in @($ActiveJobs)) {
+    $elapsed = (Get-Date) - $StartTimes[$job.Id]
+
+    if ($elapsed.TotalSeconds -gt $TimeoutSeconds) {
+        $meta = $JobMeta[$job.Id]
+        $computer = $meta.Computer
+        $attempt  = $meta.Attempt
+
+        Write-Log "TIMEOUT: $computer exceeded $TimeoutSeconds seconds (attempt $attempt)" 'ERROR'
+        Stop-Job $job -Force
+
+        $Completed += [pscustomobject]@{
+            ComputerName = $computer
+            Status       = 'Failed'
+            OldVersion   = ''
+            NewVersion   = ''
+            DurationSec  = [math]::Round($elapsed.TotalSeconds,2)
+            Details      = 'Timeout'
+            Attempt      = $attempt
+            Timeout      = $true
+        }
+
+        Remove-Job $job -Force
+        $ActiveJobs = @($ActiveJobs | Where-Object Id -ne $job.Id)
+        $JobMeta.Remove($job.Id) | Out-Null
+        $StartTimes.Remove($job.Id) | Out-Null
+        
         }
     }
+
 
     # Dashboard
     if ($DashboardTimer.Elapsed.TotalSeconds -ge 5) {

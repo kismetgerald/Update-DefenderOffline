@@ -623,7 +623,7 @@ while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
             $details -match 'dns' -or
             $result.Timeout
 
-        if ($result.Status -eq 'Failed' -and -not $isHardFail -and $attempt -lt 3) {
+        if ($result.Status -eq 'Failed' -and -not $isHardFail -and $attempt -lt $RetryLimit) {
             # Retryable failure
             Write-Log "Retry scheduled for $computer (attempt $attempt → $($attempt + 1))" 'WARN'
             $Queue += [pscustomobject]@{

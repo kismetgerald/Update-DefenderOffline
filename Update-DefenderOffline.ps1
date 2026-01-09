@@ -604,7 +604,7 @@ while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
 
         # Write per-host log
         $hostLog = Join-Path $PerHostLogDir "$computer.log"
-        Add-Content -Path $hostLog -Value "$(Get-Date) Attempt $attempt: $($result.Status) - $($result.Details)"
+        Add-Content -Path $hostLog -Value "$(Get-Date) Attempt ${attempt}: $($result.Status) - $($result.Details)"
 
         # -------------------------------
         # FAILURE CLASSIFICATION LOGIC
@@ -642,7 +642,7 @@ while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
         $ActiveJobs = @($ActiveJobs | Where-Object Id -ne $job.Id)
         $JobMeta.Remove($job.Id) | Out-Null
         $StartTimes.Remove($job.Id) | Out-Null
-        
+
         }
     }
 

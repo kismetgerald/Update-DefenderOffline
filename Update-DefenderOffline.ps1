@@ -627,7 +627,7 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
                 if ($result.Status -eq 'Failed' -and -not $isHardFail -and $attempt -lt $RetryLimit) {
                     # Retryable failure
                     Write-Log "Retry scheduled for $computer (attempt $attempt → $($attempt + 1))" 'WARN'
-                    $Queue += [pscustomobject]@{
+                    $Queue = @($Queue) + [pscustomobject]@{
                         Computer = $computer
                         Attempt  = $attempt + 1
                         Status   = 'Pending'

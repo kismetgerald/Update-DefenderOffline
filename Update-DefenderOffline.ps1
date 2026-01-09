@@ -345,18 +345,8 @@ function Invoke-DefenderUpdate {
         }
         $result.OldVersion = $currentVer
 
-        if ($MpamFileName -notmatch '(\d+\.\d+\.\d+\.\d+)') {
-            throw "Cannot parse version from filename: $MpamFileName"
-        }
-        $newVer = [version]$Matches[1]
-
-        if ($currentVer -and $currentVer -ge $newVer) {
-            $result.Status = 'No Update Needed'
-            $result.NewVersion = $currentVer
-            $result.Details = "Already at version $currentVer"
-            Remove-PSSession $session -ErrorAction SilentlyContinue
-            return $result
-        }
+        # No filename-based version parsing.
+        # We always install the package and determine the version afterward.
 
         Invoke-Command -Session $session -ScriptBlock {
             New-Item -Path $using:TempFolderOnTarget -ItemType Directory -Force | Out-Null
@@ -396,7 +386,7 @@ function Invoke-DefenderUpdate {
         }
         Remove-PSSession $session
 
-        if ($install.ExitCode -eq 0 -and $finalVer -ge $newVer) {
+        if ($install.ExitCode -eq 0 -and $finalVer) {
             $result.Status = 'Success'
             $result.Details = "$currentVer → $finalVer"
         } else {
@@ -460,18 +450,8 @@ $UpdateScriptBlock = {
         }
         $result.OldVersion = $currentVer
 
-        if ($MpamFileName -notmatch '(\d+\.\d+\.\d+\.\d+)') {
-            throw "Cannot parse version from filename: $MpamFileName"
-        }
-        $newVer = [version]$Matches[1]
-
-        if ($currentVer -and $currentVer -ge $newVer) {
-            $result.Status = 'No Update Needed'
-            $result.NewVersion = $currentVer
-            $result.Details = "Already at version $currentVer"
-            Remove-PSSession $session -ErrorAction SilentlyContinue
-            return $result
-        }
+        # No filename-based version parsing.
+        # We always install the package and determine the version afterward.
 
         Invoke-Command -Session $session -ScriptBlock { New-Item -Path $using:TempFolderOnTarget -ItemType Directory -Force | Out-Null }
         $remoteFile = Invoke-Command -Session $session -ScriptBlock { Join-Path $using:TempFolderOnTarget $using:MpamFileName }
@@ -504,7 +484,7 @@ $UpdateScriptBlock = {
         Invoke-Command -Session $session -ScriptBlock { Remove-Item (Split-Path $using:remoteFile -Parent) -Recurse -Force -ErrorAction SilentlyContinue }
         Remove-PSSession $session
 
-        if ($install.ExitCode -eq 0 -and $finalVer -ge $newVer) {
+        if ($install.ExitCode -eq 0 -and $finalVer) {
             $result.Status = 'Success'
             $result.Details = "$currentVer → $finalVer"
         } else {

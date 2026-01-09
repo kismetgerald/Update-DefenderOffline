@@ -282,6 +282,7 @@ Write-Log "Will process $($TargetComputers.Count) computers" 'HEADER'
 # ===================================================================
 # Detect Latest mpam-fe.exe File
 # ===================================================================
+
 function Get-LatestMpamFile {
     param([string]$Root)
 
@@ -291,21 +292,13 @@ function Get-LatestMpamFile {
         throw "No mpam-fe*.exe files found under $Root"
     }
 
-    # Extract version from filename (e.g. mpam-fe_4_1.443.512.0.exe)
-    $filesWithVersion = foreach ($f in $files) {
-        if ($f.Name -match '(\d+\.\d+\.\d+\.\d+)') {
-            [pscustomobject]@{
-                File    = $f.FullName
-                Version = [version]$Matches[1]
-            }
-        }
-    }
+    # Pick the newest file by LastWriteTime
+    $latest = $files | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 
-    if (-not $filesWithVersion) {
-        throw "Found mpam-fe.exe files but none contained a version number."
+    return [pscustomobject]@{
+        File    = $latest.FullName
+        Version = 'Unknown'  # We will detect version after install
     }
-
-    return $filesWithVersion | Sort-Object Version -Descending | Select-Object -First 1
 }
 
 # ===================================================================

@@ -581,7 +581,7 @@ while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
     $job | Add-Member -NotePropertyName Computer -NotePropertyValue $comp
     $job | Add-Member -NotePropertyName Attempt  -NotePropertyValue $attempt
 
-    $ActiveJobs += $job
+    $ActiveJobs = @($ActiveJobs) + $job
 }
 
 
@@ -608,7 +608,7 @@ while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
             }
 
             Remove-Job $job -Force
-            $ActiveJobs = $ActiveJobs | Where-Object Id -ne $job.Id
+            $ActiveJobs = @($ActiveJobs | Where-Object Id -ne $job.Id)
         }
     }
 
@@ -631,7 +631,7 @@ while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
             }
 
             Remove-Job $job -Force
-            $ActiveJobs = $ActiveJobs | Where-Object Id -ne $job.Id
+            $ActiveJobs = @($ActiveJobs | Where-Object Id -ne $job.Id)
         }
     }
 

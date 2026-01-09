@@ -589,7 +589,32 @@ while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
     foreach ($job in @($ActiveJobs)) {
         if ($job.State -in 'Completed','Failed','Stopped') {
             $result = Receive-Job $job -ErrorAction SilentlyContinue
-            $result.Attempt = $job.Attempt
+
+            # Normalize result: handle null, arrays, or missing properties
+            if (-not $result) {
+                # Job produced no output – synthesize a failure result
+                $result = [pscustomobject]@{
+                    ComputerName = $job.Computer
+                    Status       = 'Failed'
+                    OldVersion   = ''
+                    NewVersion   = ''
+                    DurationSec  = 0
+                    Details      = 'Job produced no output'
+                    Attempt      = $job.Attempt
+                    Timeout      = $false
+                }
+            }
+            elseif ($result -is [array]) {
+                # If multiple objects, take the last one (most likely the main result)
+                $result = $result[-1]
+            }
+
+            # Ensure Attempt property exists
+            if ($result.PSObject.Properties.Name -contains 'Attempt') {
+                $result.Attempt = $job.Attempt
+            } else {
+                $result | Add-Member -NotePropertyName Attempt -NotePropertyValue $job.Attempt -Force
+            }
 
             # Write per-host log
             $hostLog = Join-Path $PerHostLogDir "$($job.Computer).log"

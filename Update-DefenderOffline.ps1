@@ -586,7 +586,7 @@ while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
 
 
     # Check for completed jobs
-    foreach ($job in $ActiveJobs.ToArray()) {
+    foreach ($job in @($ActiveJobs)) {
         if ($job.State -in 'Completed','Failed','Stopped') {
             $result = Receive-Job $job -ErrorAction SilentlyContinue
             $result.Attempt = $job.Attempt
@@ -613,7 +613,7 @@ while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
     }
 
     # Timeout handling
-    foreach ($job in $ActiveJobs.ToArray()) {
+    foreach ($job in @($ActiveJobs)) {
         $elapsed = (Get-Date) - $StartTimes[$job.Id]
         if ($elapsed.TotalSeconds -gt $TimeoutSeconds) {
             Write-Log "TIMEOUT: $($job.Computer) exceeded $TimeoutSeconds seconds" 'ERROR'

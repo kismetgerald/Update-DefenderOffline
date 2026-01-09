@@ -508,198 +508,196 @@ $UpdateScriptBlock = {
 # ===================================================================
 
 $Results = @()
-$MaxConcurrent = $ParallelThreads
-$TimeoutSeconds = 300  # 5 minutes
-$RetryLimit = 2
 
-# Prepare per-host log directory
-$PerHostLogDir = Join-Path $LogPath "PerHost"
-if (-not (Test-Path $PerHostLogDir)) {
-    New-Item -Path $PerHostLogDir -ItemType Directory -Force | Out-Null
-}
+if ($PSVersionTable.PSVersion.Major -ge 7) {
+    $MaxConcurrent  = $ParallelThreads
+    $TimeoutSeconds = 300  # 5 minutes
+    $RetryLimit     = 3
 
-# Build job queue
-$Queue = foreach ($comp in $TargetComputers) {
-    [pscustomobject]@{
-        Computer = $comp
-        Attempt  = 1
-        Status   = 'Pending'
-    }
-}
-
-$ActiveJobs = @()
-$Completed = @()
-$StartTimes = @{}
-$JobMeta = @{}  # Key: Job.Id, Value: @{ Computer = <string>; Attempt = <int> }
-
-Write-Log "Executing in THREADJOB mode ($MaxConcurrent concurrent jobs)" 'HEADER'
-
-$DashboardTimer = [System.Diagnostics.Stopwatch]::StartNew()
-
-while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
-
-    # Launch new jobs if capacity available
-    while ($ActiveJobs.Count -lt $MaxConcurrent -and $Queue.Count -gt 0) {
-    $item = $Queue[0]
-    $Queue = if ($Queue.Count -gt 1) { $Queue[1..($Queue.Count - 1)] } else { @() }
-
-    # Extract values into simple variables for Start-ThreadJob
-    $comp    = $item.Computer
-    $attempt = $item.Attempt
-
-    $job = Start-ThreadJob -ScriptBlock {
-        Invoke-DefenderUpdate `
-            -Computer $using:comp `
-            -SourceFile $using:SourceFile `
-            -TempFolderOnTarget $using:TempFolderOnTarget `
-            -MpamFileName $using:MpamFileName `
-            -WhatIfMode:$using:WhatIfMode `
-            -LogSharePath $using:LogSharePath
+    # Prepare per-host log directory
+    $PerHostLogDir = Join-Path $LogPath "PerHost"
+    if (-not (Test-Path $PerHostLogDir)) {
+        New-Item -Path $PerHostLogDir -ItemType Directory -Force | Out-Null
     }
 
-    # Track start time and metadata (do NOT use Add-Member on the job)
-    $StartTimes[$job.Id] = Get-Date
-    $JobMeta[$job.Id] = @{
-        Computer = $comp
-        Attempt  = $attempt
+    # Build job queue
+    $Queue = foreach ($comp in $TargetComputers) {
+        [pscustomobject]@{
+            Computer = $comp
+            Attempt  = 1
+            Status   = 'Pending'
+        }
     }
 
-    $ActiveJobs = @($ActiveJobs) + $job
-}
+    $ActiveJobs  = @()
+    $Completed   = @()
+    $StartTimes  = @{}
+    $JobMeta     = @{}  # Key: Job.Id, Value: @{ Computer = <string>; Attempt = <int> }
 
-    # Check for completed jobs
-    foreach ($job in @($ActiveJobs)) {
-    if ($job.State -in 'Completed','Failed','Stopped') {
+    Write-Log "Executing in THREADJOB mode ($MaxConcurrent concurrent jobs)" 'HEADER'
 
-        # Look up metadata for this job
-        $meta = $JobMeta[$job.Id]
-        $computer = $meta.Computer
-        $attempt  = $meta.Attempt
+    $DashboardTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
-        $result = Receive-Job $job -ErrorAction SilentlyContinue
+    while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
 
-        # Normalize result: handle null or arrays
-        if (-not $result) {
-            $result = [pscustomobject]@{
-                ComputerName = $computer
-                Status       = 'Failed'
-                OldVersion   = ''
-                NewVersion   = ''
-                DurationSec  = 0
-                Details      = 'Job produced no output'
-                Attempt      = $attempt
-                Timeout      = $false
+        # Launch new jobs if capacity available
+        while ($ActiveJobs.Count -lt $MaxConcurrent -and $Queue.Count -gt 0) {
+            $item  = $Queue[0]
+            $Queue = if ($Queue.Count -gt 1) { $Queue[1..($Queue.Count - 1)] } else { @() }
+
+            # Extract values into simple variables for Start-ThreadJob
+            $comp    = $item.Computer
+            $attempt = $item.Attempt
+
+            $job = Start-ThreadJob -ScriptBlock ${function:Invoke-DefenderUpdate} -ArgumentList @(
+                $comp,
+                $SourceFile,
+                $TempFolderOnTarget,
+                $MpamFileName,
+                $WhatIfMode,
+                $LogSharePath
+            )
+
+            # Track start time and metadata (do NOT use Add-Member on the job)
+            $StartTimes[$job.Id] = Get-Date
+            $JobMeta[$job.Id] = @{
+                Computer = $comp
+                Attempt  = $attempt
+            }
+
+            $ActiveJobs = @($ActiveJobs) + $job
+        }
+
+        # Check for completed jobs
+        foreach ($job in @($ActiveJobs)) {
+            if ($job.State -in 'Completed','Failed','Stopped') {
+
+                # Look up metadata for this job
+                $meta     = $JobMeta[$job.Id]
+                $computer = $meta.Computer
+                $attempt  = $meta.Attempt
+
+                $result = Receive-Job $job -ErrorAction SilentlyContinue
+
+                # Normalize result: handle null or arrays
+                if (-not $result) {
+                    $result = [pscustomobject]@{
+                        ComputerName = $computer
+                        Status       = 'Failed'
+                        OldVersion   = ''
+                        NewVersion   = ''
+                        DurationSec  = 0
+                        Details      = 'Job produced no output'
+                        Attempt      = $attempt
+                        Timeout      = $false
+                    }
+                }
+                elseif ($result -is [array]) {
+                    $result = $result[-1]
+                }
+
+                # Ensure Attempt is present and aligned with metadata
+                if ($result.PSObject.Properties.Name -contains 'Attempt') {
+                    $result.Attempt = $attempt
+                } else {
+                    $result | Add-Member -NotePropertyName Attempt -NotePropertyValue $attempt -Force
+                }
+
+                # Write per-host log
+                $hostLog = Join-Path $PerHostLogDir "$computer.log"
+                Add-Content -Path $hostLog -Value "$(Get-Date) Attempt ${attempt}: $($result.Status) - $($result.Details)"
+
+                # -------------------------------
+                # FAILURE CLASSIFICATION LOGIC
+                # -------------------------------
+
+                $details = ($result.Details ?? '').ToString().ToLower()
+
+                $isHardFail =
+                    $details -match 'winrm' -or
+                    $details -match 'not reachable' -or
+                    $details -match 'offline' -or
+                    $details -match 'unreachable' -or
+                    $details -match 'access denied' -or
+                    $details -match 'authentication' -or
+                    $details -match 'cannot find' -or
+                    $details -match 'dns' -or
+                    $result.Timeout
+
+                if ($result.Status -eq 'Failed' -and -not $isHardFail -and $attempt -lt $RetryLimit) {
+                    # Retryable failure
+                    Write-Log "Retry scheduled for $computer (attempt $attempt → $($attempt + 1))" 'WARN'
+                    $Queue += [pscustomobject]@{
+                        Computer = $computer
+                        Attempt  = $attempt + 1
+                        Status   = 'Pending'
+                    }
+                }
+                else {
+                    # Hard fail OR retry limit reached OR success
+                    $Completed += $result
+                }
+
+                # Cleanup
+                Remove-Job $job -Force
+                $ActiveJobs = @($ActiveJobs | Where-Object Id -ne $job.Id)
+                $JobMeta.Remove($job.Id)     | Out-Null
+                $StartTimes.Remove($job.Id)  | Out-Null
             }
         }
-        elseif ($result -is [array]) {
-            $result = $result[-1]
-        }
 
-        # Ensure Attempt is present and aligned with metadata
-        if ($result.PSObject.Properties.Name -contains 'Attempt') {
-            $result.Attempt = $attempt
-        } else {
-            $result | Add-Member -NotePropertyName Attempt -NotePropertyValue $attempt -Force
-        }
+        # Timeout handling
+        foreach ($job in @($ActiveJobs)) {
+            $elapsed = (Get-Date) - $StartTimes[$job.Id]
 
-        # Write per-host log
-        $hostLog = Join-Path $PerHostLogDir "$computer.log"
-        Add-Content -Path $hostLog -Value "$(Get-Date) Attempt ${attempt}: $($result.Status) - $($result.Details)"
+            if ($elapsed.TotalSeconds -gt $TimeoutSeconds) {
+                $meta     = $JobMeta[$job.Id]
+                $computer = $meta.Computer
+                $attempt  = $meta.Attempt
 
-        # -------------------------------
-        # FAILURE CLASSIFICATION LOGIC
-        # -------------------------------
+                Write-Log "TIMEOUT: $computer exceeded $TimeoutSeconds seconds (attempt $attempt)" 'ERROR'
+                Stop-Job $job -Force
 
-        $details = $result.Details.ToLower()
+                $Completed += [pscustomobject]@{
+                    ComputerName = $computer
+                    Status       = 'Failed'
+                    OldVersion   = ''
+                    NewVersion   = ''
+                    DurationSec  = [math]::Round($elapsed.TotalSeconds,2)
+                    Details      = 'Timeout'
+                    Attempt      = $attempt
+                    Timeout      = $true
+                }
 
-        $isHardFail =
-            $details -match 'winrm' -or
-            $details -match 'not reachable' -or
-            $details -match 'offline' -or
-            $details -match 'unreachable' -or
-            $details -match 'access denied' -or
-            $details -match 'authentication' -or
-            $details -match 'cannot find' -or
-            $details -match 'dns' -or
-            $result.Timeout
-
-        if ($result.Status -eq 'Failed' -and -not $isHardFail -and $attempt -lt $RetryLimit) {
-            # Retryable failure
-            Write-Log "Retry scheduled for $computer (attempt $attempt → $($attempt + 1))" 'WARN'
-            $Queue += [pscustomobject]@{
-                Computer = $computer
-                Attempt  = $attempt + 1
-                Status   = 'Pending'
+                Remove-Job $job -Force
+                $ActiveJobs = @($ActiveJobs | Where-Object Id -ne $job.Id)
+                $JobMeta.Remove($job.Id)     | Out-Null
+                $StartTimes.Remove($job.Id)  | Out-Null
             }
         }
-        else {
-            # Hard fail OR retry limit reached OR success
-            $Completed += $result
+
+        # Dashboard
+        if ($DashboardTimer.Elapsed.TotalSeconds -ge 5) {
+            $DashboardTimer.Restart()
+            $running = $ActiveJobs.Count
+            $pending = $Queue.Count
+            $done    = $Completed.Count
+
+            Write-Host ""
+            Write-Host "=== Defender Update Dashboard ===" -ForegroundColor Cyan
+            Write-Host "Running:     $running"
+            Write-Host "Pending:     $pending"
+            Write-Host "Completed:   $done"
+            Write-Host "Elapsed:     $([string]::Format('{0:hh\:mm\:ss}', (Get-Date) - $ScriptStartTime))"
+            Write-Host ""
         }
 
-        # Cleanup
-        Remove-Job $job -Force
-        $ActiveJobs = @($ActiveJobs | Where-Object Id -ne $job.Id)
-        $JobMeta.Remove($job.Id) | Out-Null
-        $StartTimes.Remove($job.Id) | Out-Null
-
-        }
+        Start-Sleep -Milliseconds 500
     }
 
-    # Timeout handling
-    foreach ($job in @($ActiveJobs)) {
-    $elapsed = (Get-Date) - $StartTimes[$job.Id]
-
-    if ($elapsed.TotalSeconds -gt $TimeoutSeconds) {
-        $meta = $JobMeta[$job.Id]
-        $computer = $meta.Computer
-        $attempt  = $meta.Attempt
-
-        Write-Log "TIMEOUT: $computer exceeded $TimeoutSeconds seconds (attempt $attempt)" 'ERROR'
-        Stop-Job $job -Force
-
-        $Completed += [pscustomobject]@{
-            ComputerName = $computer
-            Status       = 'Failed'
-            OldVersion   = ''
-            NewVersion   = ''
-            DurationSec  = [math]::Round($elapsed.TotalSeconds,2)
-            Details      = 'Timeout'
-            Attempt      = $attempt
-            Timeout      = $true
-        }
-
-        Remove-Job $job -Force
-        $ActiveJobs = @($ActiveJobs | Where-Object Id -ne $job.Id)
-        $JobMeta.Remove($job.Id) | Out-Null
-        $StartTimes.Remove($job.Id) | Out-Null
-
-        }
-    }
-
-
-    # Dashboard
-    if ($DashboardTimer.Elapsed.TotalSeconds -ge 5) {
-        $DashboardTimer.Restart()
-        $running = $ActiveJobs.Count
-        $pending = $Queue.Count
-        $done    = $Completed.Count
-
-        Write-Host ""
-        Write-Host "=== Defender Update Dashboard ===" -ForegroundColor Cyan
-        Write-Host "Running:     $running"
-        Write-Host "Pending:     $pending"
-        Write-Host "Completed:   $done"
-        Write-Host "Elapsed:     $([string]::Format('{0:hh\:mm\:ss}', (Get-Date) - $ScriptStartTime))"
-        Write-Host ""
-    }
-
-    Start-Sleep -Milliseconds 500
+    $Results = $Completed
+    Write-Log "ThreadJob execution completed: $($Results.Count) computers processed" 'SUCCESS'
 }
-
-$Results = $Completed
-Write-Log "ThreadJob execution completed: $($Results.Count) computers processed" 'SUCCESS'
-
 else {
     # SERIAL MODE (PowerShell 5.1)
     Write-Log "Executing in SERIAL mode (PowerShell 5.1)" 'WARN'
@@ -815,15 +813,16 @@ function New-HtmlReport {
             <th>Delta</th>
         </tr>
         $(
-            $Data | ForEach-Object {
+            ($Data | ForEach-Object {
                 "<tr>
                     <td>$($_.ComputerName)</td>
                     <td>$($_.OldVersion)</td>
                     <td>$($_.NewVersion)</td>
                     <td>$($_.Delta)</td>
                 </tr>"
-            } -join "`n"
+            }) -join "`n"
         )
+
     </table>
 
     <h2>Summary: $summary</h2>

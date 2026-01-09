@@ -559,25 +559,31 @@ while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
 
     # Launch new jobs if capacity available
     while ($ActiveJobs.Count -lt $MaxConcurrent -and $Queue.Count -gt 0) {
-        $item = $Queue[0]
-        $Queue = $Queue[1..($Queue.Count - 1)] 2>$null
+    $item = $Queue[0]
+    $Queue = $Queue[1..($Queue.Count - 1)] 2>$null
 
-        $job = Start-ThreadJob -ScriptBlock {
-            Invoke-DefenderUpdate `
-                -Computer $using:item.Computer `
-                -SourceFile $using:SourceFile `
-                -TempFolderOnTarget $using:TempFolderOnTarget `
-                -MpamFileName $using:MpamFileName `
-                -WhatIfMode:$using:WhatIfMode `
-                -LogSharePath $using:LogSharePath
-        }
+    # Extract values into simple variables for Start-ThreadJob
+    $comp    = $item.Computer
+    $attempt = $item.Attempt
 
-        $StartTimes[$job.Id] = Get-Date
-        $job | Add-Member -NotePropertyName Computer -NotePropertyValue $item.Computer
-        $job | Add-Member -NotePropertyName Attempt  -NotePropertyValue $item.Attempt
-
-        $ActiveJobs += $job
+    $job = Start-ThreadJob -ScriptBlock {
+        Invoke-DefenderUpdate `
+            -Computer $using:comp `
+            -SourceFile $using:SourceFile `
+            -TempFolderOnTarget $using:TempFolderOnTarget `
+            -MpamFileName $using:MpamFileName `
+            -WhatIfMode:$using:WhatIfMode `
+            -LogSharePath $using:LogSharePath
     }
+
+    # Track metadata
+    $StartTimes[$job.Id] = Get-Date
+    $job | Add-Member -NotePropertyName Computer -NotePropertyValue $comp
+    $job | Add-Member -NotePropertyName Attempt  -NotePropertyValue $attempt
+
+    $ActiveJobs += $job
+}
+
 
     # Check for completed jobs
     foreach ($job in $ActiveJobs.ToArray()) {

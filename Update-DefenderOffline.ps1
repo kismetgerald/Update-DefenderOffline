@@ -546,6 +546,7 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
     Write-Log "Executing in THREADJOB mode ($MaxConcurrent concurrent jobs)" 'HEADER'
 
     $DashboardTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    $DashboardAnchor = $null
 
     while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
 
@@ -734,6 +735,7 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
     Write-Host "=== Final Results ===" -ForegroundColor Magenta
 
     $Results |
+        Sort-Object ComputerName |
         Select-Object `
             ComputerName,
             Status,
@@ -819,15 +821,17 @@ function New-HtmlReport {
 </style>
 "@
 
-    $body = $Data | ConvertTo-Html -Fragment -Property `
-    ComputerName,
-    Status,
-    OldVersion,
-    NewVersion,
-    DurationSec,
-    RetrySuccess,
-    FailureType,
-    Details
+    $body = $Data |
+    Sort-Object ComputerName |
+    ConvertTo-Html -Fragment -Property `
+        ComputerName,
+        Status,
+        OldVersion,
+        NewVersion,
+        DurationSec,
+        RetrySuccess,
+        FailureType,
+        Details
 
     foreach ($i in 0..($body.Count-1)) {
         $body[$i] = $body[$i] -replace '<td>Success</td>', '<td class="success">Success</td>'
@@ -997,6 +1001,3 @@ if ($SendEmail -and $To -and $SmtpServer) {
         Write-Log "Failed to send email: $($_.Exception.Message)" 'ERROR'
     }
 }
-
-# Final table output
-$Results | Sort-Object ComputerName | Format-Table -AutoSize

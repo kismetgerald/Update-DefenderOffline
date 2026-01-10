@@ -677,19 +677,44 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
         }
 
         # Dashboard
+        # --- STATIC DASHBOARD (no scrolling, no flicker) ---
+        if (-not $DashboardAnchor) {
+            # Record the cursor position where the dashboard will live
+            $DashboardAnchor = $Host.UI.RawUI.CursorPosition
+        }
+
         if ($DashboardTimer.Elapsed.TotalSeconds -ge 5) {
             $DashboardTimer.Restart()
+
+            # Move cursor back to the anchor point
+            $Host.UI.RawUI.CursorPosition = $DashboardAnchor
+
             $running = $ActiveJobs.Count
             $pending = $Queue.Count
             $done    = $Completed.Count
 
-            Write-Host ""
+            # Build active host list (one line, full list)
+            $activeHosts = if ($ActiveJobs.Count -gt 0) {
+                ($ActiveJobs | ForEach-Object {
+                    $JobMeta[$_.Id].Computer
+                }) -join ', '
+            } else {
+                'None'
+            }
+
+            $elapsed = [string]::Format('{0:hh\:mm\:ss}', (Get-Date) - $ScriptStartTime)
+
+            # Overwrite the same lines every refresh
             Write-Host "=== Defender Update Dashboard ===" -ForegroundColor Cyan
             Write-Host "Running:     $running"
             Write-Host "Pending:     $pending"
             Write-Host "Completed:   $done"
-            Write-Host "Elapsed:     $([string]::Format('{0:hh\:mm\:ss}', (Get-Date) - $ScriptStartTime))"
-            Write-Host ""
+            Write-Host "Active:      $activeHosts"
+            Write-Host "Elapsed:     $elapsed"
+
+            # Pad with spaces to erase leftover characters from previous frames
+            Write-Host (" " * 80)
+            Write-Host (" " * 80)
         }
 
         Start-Sleep -Milliseconds 500

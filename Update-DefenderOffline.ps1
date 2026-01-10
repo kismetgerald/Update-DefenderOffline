@@ -78,9 +78,9 @@
                      • Network share containing the latest mpam-fe.exe (x64)
                      • (Optional) Domain-joined machine or RSAT:ActiveDirectory for auto hosts.conf generation
     
-    Version        : 0.0.4
+    Version        : 0.0.5
     Created        : 2025-11-27
-    Last Updated   : 2026-01-08
+    Last Updated   : 2026-01-09
 
 #>
 
@@ -314,6 +314,9 @@ function Invoke-DefenderUpdate {
         [string]$LogSharePath
     )
 
+    # PATCH 3 — suppress reconnect warnings inside job runspace
+    $WarningPreference = 'SilentlyContinue'
+
     $result = [pscustomobject]@{
         ComputerName = $Computer
         Status       = 'Unknown'
@@ -391,7 +394,7 @@ function Invoke-DefenderUpdate {
             $result.Details = "$currentVer → $finalVer"
         } else {
             $result.Status = 'Failed'
-            $result.Details = "Installer exit code: $($install.ExitCode)"
+            $result.Details = ($_.Exception.Message -replace "`r`n", " " -replace "\s+", " ").Trim()
         }
     }
     catch {
@@ -469,6 +472,12 @@ $UpdateScriptBlock = {
         }
         $result.NewVersion = $finalVer
 
+        # Detect "No Update Needed"
+        if ($install.ExitCode -eq 0 -and $finalVer -eq $currentVer) {
+            $result.Status  = 'No Update Needed'
+            $result.Details = 'Already current'
+        }
+
         # Collect remote logs if LogSharePath is provided and accessible
         if ($LogSharePath -and (Test-Path $LogSharePath -ErrorAction SilentlyContinue)) {
             try {
@@ -486,10 +495,10 @@ $UpdateScriptBlock = {
 
         if ($install.ExitCode -eq 0 -and $finalVer) {
             $result.Status = 'Success'
-            $result.Details = "$currentVer → $finalVer"
+            $result.Details = ("$currentVer → $finalVer").Trim()
         } else {
             $result.Status = 'Failed'
-            $result.Details = "Installer exit code: $($install.ExitCode)"
+            $result.Details = ("Installer exit code: $($install.ExitCode)").Trim()
         }
     }
     catch {
@@ -721,7 +730,20 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
     }
 
     $Results = $Completed
-    Write-Log "ThreadJob execution completed: $($Results.Count) computers processed" 'SUCCESS'
+    Write-Host ""
+    Write-Host "=== Final Results ===" -ForegroundColor Magenta
+
+    $Results |
+        Select-Object `
+            ComputerName,
+            Status,
+            OldVersion,
+            NewVersion,
+            DurationSec,
+            @{n='Attempt#'; e={$_.Attempt}},
+            @{n='Timeout?'; e={$_.Timeout}},
+            Details |
+        Format-Table -Wrap -AutoSize
 }
 else {
     # SERIAL MODE (PowerShell 5.1)
@@ -797,14 +819,27 @@ function New-HtmlReport {
 </style>
 "@
 
-    $body = $Data | ConvertTo-Html -Fragment -Property ComputerName,Status,OldVersion,NewVersion,DurationSec,Details
+    $body = $Data | ConvertTo-Html -Fragment -Property `
+    ComputerName,
+    Status,
+    OldVersion,
+    NewVersion,
+    DurationSec,
+    RetrySuccess,
+    FailureType,
+    Details
+
     foreach ($i in 0..($body.Count-1)) {
         $body[$i] = $body[$i] -replace '<td>Success</td>', '<td class="success">Success</td>'
         $body[$i] = $body[$i] -replace '<td>Failed</td>', '<td class="failed">Failed</td>'
         $body[$i] = $body[$i] -replace '<td>No Update Needed</td>', '<td class="skipped">No Update Needed</td>'
     }
 
-    $summary = "$($Data.Where{$_.Status -eq 'Success'}.Count) succeeded • $($Data.Where{$_.Status -eq 'Failed'}.Count) failed • $($Data.Where{$_.Status -eq 'No Update Needed'}.Count) already current"
+    $summary = @"
+Success: $($Data.Where{$_.Status -eq 'Success'}.Count)
+Failed: $($Data.Where{$_.Status -eq 'Failed'}.Count)
+Skipped (Already Current): $($Data.Where{$_.Status -eq 'No Update Needed'}.Count)
+"@
 
     return @"
 <!DOCTYPE html>
@@ -898,11 +933,44 @@ Write-Log "UPDATE COMPLETE in $($TotalDuration.ToString('hh\:mm\:ss'))" 'HEADER'
 Write-Log "Success: $($Results.Where{$_.Status -eq 'Success'}.Count) | Failed: $($Results.Where{$_.Status -eq 'Failed'}.Count) | Skipped: $($Results.Where{$_.Status -eq 'No Update Needed'}.Count)" 'HEADER'
 Write-Log "Report saved: $ReportFile" 'SUCCESS'
 Write-Host ""
-Write-Host "=== Version Summary ===" -ForegroundColor Cyan
-Write-Host "Oldest version found : $OldestVersion"
-Write-Host "Newest version applied: $NewestVersion"
-Write-Host "Average delta        : $AverageDelta versions"
 Write-Host ""
+Write-Host "=== Version Summary ===" -ForegroundColor Magenta
+
+# Only consider successful updates for version statistics
+$success = $Results | Where-Object { $_.Status -eq 'Success' }
+
+if ($success.Count -eq 0) {
+    Write-Host "No successful updates — version summary unavailable." -ForegroundColor Yellow
+}
+else {
+    # Extract versions safely
+    $validOld = $success | Where-Object { $_.OldVersion } | Select-Object -ExpandProperty OldVersion
+    $validNew = $success | Where-Object { $_.NewVersion } | Select-Object -ExpandProperty NewVersion
+
+    $oldest = ($validOld | Sort-Object)[0]
+    $newest = ($validNew | Sort-Object)[-1]
+
+    # Compute deltas only when versions differ and are parseable
+    $deltas = @()
+    foreach ($r in $success) {
+        if ($r.OldVersion -and $r.NewVersion -and $r.OldVersion -ne $r.NewVersion) {
+            try {
+                $deltas += ([version]$r.NewVersion - [version]$r.OldVersion).Build
+            } catch {}
+        }
+    }
+
+    $avgDelta = if ($deltas.Count -gt 0) {
+        [math]::Round(($deltas | Measure-Object -Average).Average, 2)
+    } else {
+        '0'
+    }
+
+    Write-Host "Oldest version found : $oldest"
+    Write-Host "Newest version applied: $newest"
+    Write-Host "Average delta        : $avgDelta"
+}
+
 
 # ===================================================================
 # Optional Email Notification

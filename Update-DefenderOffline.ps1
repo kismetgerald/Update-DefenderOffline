@@ -205,16 +205,17 @@ function Write-Log {
         $Global:LogMutex.ReleaseMutex()
     }
 
-    if ([System.Threading.Thread]::CurrentThread.ManagedThreadId -eq 1) {
-        switch ($Level) {
-            'INFO'    { Write-Host $line -ForegroundColor Cyan }
-            'WARN'    { Write-Host $line -ForegroundColor Yellow }
-            'ERROR'   { Write-Host $line -ForegroundColor Red }
-            'SUCCESS' { Write-Host $line -ForegroundColor Green }
-            'HEADER'  { Write-Host $line -ForegroundColor Magenta }
-            default   { Write-Host $line }
-        }
+    if (-not $SuppressConsoleOutput -and [System.Threading.Thread]::CurrentThread.ManagedThreadId -eq 1) {
+    switch ($Level) {
+        'INFO'    { Write-Host $line -ForegroundColor Cyan }
+        'WARN'    { Write-Host $line -ForegroundColor Yellow }
+        'ERROR'   { Write-Host $line -ForegroundColor Red }
+        'SUCCESS' { Write-Host $line -ForegroundColor Green }
+        'HEADER'  { Write-Host $line -ForegroundColor Magenta }
+        default   { Write-Host $line }
     }
+}
+
 }
 
 Write-Log "=== Microsoft Defender Offline Update v$ScriptVersion ===" 'HEADER'
@@ -548,6 +549,10 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
     $DashboardTimer = [System.Diagnostics.Stopwatch]::StartNew()
     $DashboardAnchor = $null
 
+    # Suppress console output during dashboard loop to prevent scrolling
+    $SuppressConsoleOutput = $true
+
+
     while ($Queue.Count -gt 0 -or $ActiveJobs.Count -gt 0) {
 
         # Launch new jobs if capacity available
@@ -731,6 +736,9 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
     }
 
     $Results = $Completed
+    # Re-enable console output now that dashboard is finished
+    $SuppressConsoleOutput = $false
+
     Write-Host ""
     Write-Host "=== Final Results ===" -ForegroundColor Magenta
 

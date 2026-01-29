@@ -78,9 +78,9 @@
                      • Network share containing the latest mpam-fe.exe (x64)
                      • (Optional) Domain-joined machine or RSAT:ActiveDirectory for auto hosts.conf generation
     
-    Version        : 0.0.5
+    Version        : 0.0.6
     Created        : 2025-11-27
-    Last Updated   : 2026-01-09
+    Last Updated   : 2026-01-28
 
 #>
 

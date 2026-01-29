@@ -942,6 +942,10 @@ $HtmlReport = New-HtmlReport -Data $Results -RunTime $TotalDuration
 $ReportFile = Join-Path $ReportPath "DefenderUpdateReport_$(Get-Date -f 'yyyyMMdd_HHmmss').html"
 $HtmlReport | Out-File -FilePath $ReportFile -Encoding utf8
 
+$CsvFile = Join-Path $ReportPath "DefenderUpdateReport_$(Get-Date -f 'yyyyMMdd_HHmmss').csv"
+$Results | Export-Csv -Path $CsvFile -NoTypeInformation
+Write-Log "CSV export saved: $CsvFile" 'SUCCESS'
+
 Write-Log "UPDATE COMPLETE in $($TotalDuration.ToString('hh\:mm\:ss'))" 'HEADER'
 Write-Log "Success: $($Results.Where{$_.Status -eq 'Success'}.Count) | Failed: $($Results.Where{$_.Status -eq 'Failed'}.Count) | Skipped: $($Results.Where{$_.Status -eq 'No Update Needed'}.Count)" 'HEADER'
 Write-Log "Report saved: $ReportFile" 'SUCCESS'

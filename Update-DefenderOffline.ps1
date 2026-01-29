@@ -449,6 +449,14 @@ $UpdateScriptBlock = {
 
         $session = New-PSSession -ComputerName $Computer -ErrorAction Stop
 
+        # Add Pre-Update Health Check
+        $defenderStatus = Invoke-Command -Session $session -ScriptBlock {
+            Get-Service -Name WinDefend | Select-Object Status
+        }
+        if ($defenderStatus.Status -ne 'Running') {
+            throw "Windows Defender service not running"
+        }
+
         $currentVer = Invoke-Command -Session $session -ScriptBlock {
             try { (Get-MpComputerStatus -ErrorAction Stop).AntivirusSignatureVersion } catch { $null }
         }
